@@ -35,7 +35,7 @@ class BMP085(sensor.Sensor):
 
 	def getVal(self):
 		if self.valName == "Temperature":
-			temp = BMP085.bmpClass.readTemperature()
+			temp = BMP085.bmpClass.readTemperature() - 10
 			if self.valUnit == "Fahrenheit":
 				temp = temp * 1.8 + 32
 			return temp
