@@ -1,203 +1,174 @@
-#This file takes in inputs from a variety of sensor files, and outputs information to a variety of services
-import sys
-sys.dont_write_bytecode = True
-
-import RPi.GPIO as GPIO
-import ConfigParser
-import time
-import inspect
-import os
-from sys import exit
-from sensors import sensor
-from outputs import output
-
-def get_subclasses(mod,cls):
-	for name, obj in inspect.getmembers(mod):
-		if hasattr(obj, "__bases__") and cls in obj.__bases__:
-			return obj
-
-
-if not os.path.isfile('sensors.cfg'):
-	print "Unable to access config file: sensors.cfg"
-	exit(1)
-
-sensorConfig = ConfigParser.SafeConfigParser()
-sensorConfig.read('sensors.cfg')
-
-sensorNames = sensorConfig.sections()
-
-GPIO.setwarnings(False)
-GPIO.setmode(GPIO.BCM) #Use BCM GPIO numbers.
-
-sensorPlugins = []
-for i in sensorNames:
-	try:	
-		try:
-			filename = sensorConfig.get(i,"filename")
-		except Exception:
-			print("Error: no filename config option found for sensor plugin " + i)
-			raise
-		try:
-			enabled = sensorConfig.getboolean(i,"enabled")
-		except Exception:
-			enabled = True
-
-		#if enabled, load the plugin
-		if enabled:
-			try:
-				mod = __import__('sensors.'+filename,fromlist=['a']) #Why does this work?
-			except Exception:
-				print("Error: could not import sensor module " + filename)
-				raise
-
-			try:	
-				sensorClass = get_subclasses(mod,sensor.Sensor)
-				if sensorClass == None:
-					raise AttributeError
-			except Exception:
-				print("Error: could not find a subclass of sensor.Sensor in module " + filename)
-				raise
-
-			try:	
-				reqd = sensorClass.requiredData
-			except Exception:
-				reqd =  []
-			try:
-				opt = sensorClass.optionalData
-			except Exception:
-				opt = []
-
-			pluginData = {}
-
-			class MissingField(Exception): pass
-						
-			for requiredField in reqd:
-				if sensorConfig.has_option(i,requiredField):
-					pluginData[requiredField]=sensorConfig.get(i,requiredField)
-				else:
-					print "Error: Missing required field '" + requiredField + "' for sensor plugin " + i
-					raise MissingField
-			for optionalField in opt:
-				if sensorConfig.has_option(i,optionalField):
-					pluginData[optionalField]=sensorConfig.get(i,optionalField)
-			instClass = sensorClass(pluginData)
-			sensorPlugins.append(instClass)
-			print ("Success: Loaded sensor plugin " + i)
-	except Exception as e: #add specific exception for missing module
-		print("Error: Did not import sensor plugin " + i )
-		raise e
-
-
-if not os.path.isfile("outputs.cfg"):
-	print "Unable to access config file: outputs.cfg"
-
-outputConfig = ConfigParser.SafeConfigParser()
-outputConfig.read("outputs.cfg")
-
-outputNames = outputConfig.sections()
-
-outputPlugins = []
-
-for i in outputNames:
-	try:	
-		try:
-			filename = outputConfig.get(i,"filename")
-		except Exception:
-			print("Error: no filename config option found for output plugin " + i)
-			raise
-		try:
-			enabled = outputConfig.getboolean(i,"enabled")
-		except Exception:
-			enabled = True
-
-		#if enabled, load the plugin
-		if enabled:
-			try:
-				mod = __import__('outputs.'+filename,fromlist=['a']) #Why does this work?
-			except Exception:
-				print("Error: could not import output module " + filename)
-				raise
-
-			try:	
-				outputClass = get_subclasses(mod,output.Output)
-				if outputClass == None:
-					raise AttributeError
-			except Exception:
-				print("Error: could not find a subclass of output.Output in module " + filename)
-				raise
-			try:	
-				reqd = outputClass.requiredData
-			except Exception:
-				reqd =  []
-			try:
-				opt = outputClass.optionalData
-			except Exception:
-				opt = []
-			
-			if outputConfig.has_option(i,"async"):
-				async = outputConfig.getbool(i,"async")
-			else:
-				async = False
-			
-			pluginData = {}
-
-			class MissingField(Exception): pass
-						
-			for requiredField in reqd:
-				if outputConfig.has_option(i,requiredField):
-					pluginData[requiredField]=outputConfig.get(i,requiredField)
-				else:
-					print "Error: Missing required field '" + requiredField + "' for output plugin " + i
-					raise MissingField
-			for optionalField in opt:
-				if outputConfig.has_option(i,optionalField):
-					pluginData[optionalField]=outputConfig.get(i,optionalField)
-			instClass = outputClass(pluginData)
-			instClass.async = async
-			outputPlugins.append(instClass)
-			print ("Success: Loaded output plugin " + i)
-	except Exception as e: #add specific exception for missing module
-		print("Error: Did not import output plugin " + i )
-		raise e
-
-if not os.path.isfile("settings.cfg"):
-	print "Unable to access config file: settings.cfg"
-
-mainConfig = ConfigParser.SafeConfigParser()
-mainConfig.read("settings.cfg")
-
-lastUpdated = 0
-delayTime = mainConfig.getfloat("Main","uploadDelay")
-redPin = mainConfig.getint("Main","redPin")
-greenPin = mainConfig.getint("Main","greenPin")
-GPIO.setup(redPin,GPIO.OUT,initial=GPIO.LOW)
-GPIO.setup(greenPin,GPIO.OUT,initial=GPIO.LOW)
+#!/usr/bin/env python
+import time 						# Library for delays
+import RPi.GPIO as GPIO 			# Library for using the GPIO ports
+from  math import log1p,exp,log10 	# Library for math functions. No need for it if you'll get the raw data from the sensors
+from ubidots import ApiClient  		# Ubidots Library
+import Adafruit_DHT 				# Library from Adafruit to simplify the use of DHT sensor.
+ 
+# Set up the SPI interface pins. Through SPI we can connect to the ADC MCP3008
+ 
+SPICLK = 18
+SPIMISO = 24
+SPIMOSI = 23
+SPICS = 25
+ 
+GPIO.setmode(GPIO.BCM) 				# Set up BCM as numbering system for inputs
+GPIO.setup(SPIMOSI, GPIO.OUT)		# Configure the SPI I/O
+GPIO.setup(SPIMISO, GPIO.IN)
+GPIO.setup(SPICLK, GPIO.OUT)
+GPIO.setup(SPICS, GPIO.OUT)
+ 
+# Setup Variables
+ 
+dS = None 							# Ubidots Data source. We'll call Airpi
+sensor = Adafruit_DHT.AM2302			# Especify the DHT sensor we will use 
+									# You can change this line for other DHT sensors like this: Adafruit_DHT.DHT11 or Adafruit_DHT.DHT22
+light = 0 							# Save  value of the LDR
+noise = 0 							# Save value of the Mic in
+no2 = 0 							# Save value for Nitrogen dioxide level
+co = 0 								# Save value for Carbon monoxide level
+hum = 0 								# Save value for Humidity
+temperature = 0 						# Save value for Temperature
+vin = 3.3  							# Voltage reference for the ADC    
+ 
+# Function to verify if the variable exists or not in your Ubidots account
+ 
+def getVarbyNames(varName,dS):
+	for var in dS.get_variables():
+		if var.name == varName:
+			return var
+	return None
+ 
+# Function from Adafruit to read analog values
+ 
+def readadc(adcnum, clockpin, mosipin, misopin, cspin):
+        if ((adcnum > 7) or (adcnum < 0)):
+                return -1
+        GPIO.output(cspin, True)
+ 
+        GPIO.output(clockpin, False)  		# start clock low
+        GPIO.output(cspin, False)     		# bring CS low
+ 
+        commandout = adcnum
+        commandout |= 0x18  				# start bit + single-ended bit
+        commandout <<= 3    				# we only need to send 5 bits here
+        for i in range(5):
+                if (commandout & 0x80):
+                        GPIO.output(mosipin, True)
+                else:
+                        GPIO.output(mosipin, False)
+                commandout <<= 1
+                GPIO.output(clockpin, True)
+                GPIO.output(clockpin, False)
+        adcout = 0
+        # read in one empty bit, one null bit and 10 ADC bits
+        for i in range(12):
+                GPIO.output(clockpin, True)
+                GPIO.output(clockpin, False)
+                adcout <<= 1
+                if (GPIO.input(misopin)):
+                        adcout |= 0x1
+        GPIO.output(cspin, True)
+        
+        adcout >>= 1       					# first bit is 'null' so drop it
+        return adcout
+ 
+# Code to connect a Ubidots
+ 
+try:
+   api = ApiClient("75617caf2933588b7fd0da531155d16035138535") # Connect to Ubidots. Don't forget to put your own apikey
+   
+   for curDs in api.get_datasources():						# Check if there's any Data Source with the name AirPi
+	if curDs.name == "AirPi":
+		dS = curDs
+		break
+   if dS is None:
+   	  dS = api.create_datasource({"name":"AirPi"})			# If doesn't exist it'll create a Data Source with the name Airpi
+  
+   lightValue = getVarbyNames("Light_level",dS)
+   if lightValue is None:
+	  lightValue = dS.create_variable({"name": "Light_level","unit": "lux"}) # Create a new Variable for light
+ 
+   nitrogen = getVarbyNames("Nitrogen_dioxide_concentration",dS)
+   if nitrogen is None:
+	  nitrogen = dS.create_variable({"name": "Nitrogen_dioxide_concentration", "unit": "ppm"}) # Create a new Variable for NO2 level
+ 
+   mic = getVarbyNames("Noise_level", dS)
+   if mic is None:
+	  mic = dS.create_variable({"name": "Noise_level","unit": "mV"}) # Create a new Variable for noise level
+ 
+   carbon = getVarbyNames("Carbon_monoxide_concentration",dS)
+   if carbon is None:
+	  carbon = dS.create_variable({"name": "Carbon_monoxide_concentration","unit": "ppm"}) # Create a new Variable for CO level
+  
+ 
+   temp = getVarbyNames("Temperature",dS)
+   if temp is None:
+	  temp = dS.create_variable({"name": "Temperature", "unit": "C"})	#Create a new Variable for temperature
+ 
+   humidity = getVarbyNames("Humidity",dS)
+   if humidity is None:
+	  humidity = dS.create_variable({"name": "Humidity","unit": "%"}) # Create a new Variable for humidity
+ 
+except:
+   print("Can't connect to Ubidots")
+ 
 while True:
-	curTime = time.time()
-	if (curTime-lastUpdated)>delayTime:
-		lastUpdated = curTime
-		data = []
-		#Collect the data from each sensor
-		for i in sensorPlugins:
-			dataDict = {}
-			val = i.getVal()
-			if val==None: #this means it has no data to upload.
-				continue
-			dataDict["value"] = i.getVal()
-			dataDict["unit"] = i.valUnit
-			dataDict["symbol"] = i.valSymbol
-			dataDict["name"] = i.valName
-			dataDict["sensor"] = i.sensorName
-			data.append(dataDict)
-		working = True
-		for i in outputPlugins:
-			working = working and i.outputData(data)
-		if working:
-			print "Uploaded successfully"
-			GPIO.output(greenPin,GPIO.HIGH)
-		else:
-			print "Failed to upload"
-			GPIO.output(redPin,GPIO.HIGH)
-		time.sleep(1)
-		GPIO.output(greenPin,GPIO.LOW)
-		GPIO.output(redPin,GPIO.LOW)
+    # Code to get light levels data
+	light = readadc(0, SPICLK, SPIMOSI, SPIMISO, SPICS) # Read the analog pin where the LDR is connected
+	light = float(light)/1023*vin						# Voltage value from ADC
+	light = 10000/((vin/light)-1)						# Ohm value of the LDR, 10k is used as Pull up Resistor
+	light = exp((log1p(light/1000)-4.125)/-0.6704)		# Linear aproximation from http://pi.gate.ac.uk/posts/2014/02/25/airpisensors/ to get Lux value
+	
+	# Code to get audio levels from  20 hz frequency
+	signalMax = 0
+	signalMin = 1024
+ 	startMillis = int(round(time.time()*1000))			# Time in milliseconds
+ 
+	while (int(round(time.time()*1000))-startMillis<50):    # Collect data for 20hz frequency, 20hz=1/50ms    
+		noise = readadc(4, SPICLK, SPIMOSI, SPIMISO, SPICS) # Read the analog input where the mic is connected
+		if (noise < 1024):
+			if(noise > signalMax):
+				signalMax = noise
+			elif(noise < signalMin):
+				signalMin = noise
+	peakToPeak = signalMax - signalMin
+	print peakToPeak					# Peak to Peak value
+	db = float((peakToPeak*vin*1000)/1023)			#Measure in mV
+	time.sleep(0.1)
+	
+	# Code to read NO2 and CO concentrations
+	no2 = readadc(2, SPICLK, SPIMOSI, SPIMISO, SPICS)	# Read the analog input for the nitrogen value	
+	no2 = float(no2)/1023*vin								# Voltage value from the ADC
+	no2 = ((10000*vin)/no2)-10000							# Ohm value of the no2 resistor, 10k  is used as pull down resistor 
+	no2 = float(no2/700)					#Reference value
+	time.sleep(0.1)
+	
+	co = readadc(3, SPICLK, SPIMOSI, SPIMISO, SPICS)		# Read the analog input for the carbon value
+	co = float(co)/1023*vin 								# Voltage value from the ADC
+	co = ((360000*vin)/co)-360000							# Ohm Value of the co resistor, 360k is used as pull down resistor
+	co = float(co/30000) 					#Reference value
+	# Code to use the DHT sensor
+	hum, temperature = Adafruit_DHT.read_retry(sensor, 4)
+	if hum is not None and temperature is not None:
+        	print 'Temp={0:0.1f}*C  Humidity={1:0.1f}%'.format(temperature, hum)
+	else:
+        	print 'Failed to get DHT sensor reading. Try again!'
+	
+	# Print sensor values to the console 
+ 
+	print "light[lux]:", light
+	print "no2[ohm]:", no2
+	print "co[ohm]:", co
+	print "noise[mv]", db
+ 
+ 	# Post values to Ubidots
+ 
+	lightValue.save_value({'value':light})
+	nitrogen.save_value({'value':no2})
+	mic.save_value({'value':db})
+	carbon.save_value({'value':co})	
+	temp.save_value({'value':temperature})
+	humidity.save_value({'value':hum})
+ 
+GPIO.cleanup()						# Reset the status of the GPIO pins
